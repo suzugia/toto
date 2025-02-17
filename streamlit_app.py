@@ -5,6 +5,7 @@ import requests
 from predico import PredicoAPI
 import downloader
 import os
+import numpy as np 
 
 
 st.set_page_config(
@@ -31,6 +32,8 @@ st.markdown(
 
 user_env = os.getenv("USER") 
 pwd_env = os.getenv("PWD")
+pwd_view = os.getenv("PWD_VIEW")
+
 
 # !!!!!!!!!!!!!!!!!!
 
@@ -52,7 +55,7 @@ def list_submissions(_api):
     # Sort descending by submission time
     df_subs = df_subs.sort_values("registered_at", ascending=False)
     df_subs["registered_at"] = df_subs["registered_at"].dt.round("T")
-    df_subs = df_subs.drop_duplicates(subset=["registered_at"], keep="last")
+    df_subs = df_subs.drop_duplicates(subset=["registered_at"], keep="first")
     return df_subs
 
 # 3. Fetch data (scores + forecasts) only for the selected submission
@@ -160,6 +163,7 @@ def fetch_last_50_scores(_api):
 from plotly.subplots import make_subplots
 
 import plotly.graph_objects as go
+
 def plot_rank_and_payout_separate(df):
     # Prepare data
     df_rmse = df[df["metric"] == "rmse"].copy()
@@ -206,6 +210,51 @@ def plot_rank_and_payout_separate(df):
 
     return fig
 # ---------------- Main App ----------------
+def calculate_rmse(actual, predicted):
+    """
+    Compute Root Mean Square Error (RMSE).
+
+    Parameters:
+    - actual: array-like of true values.
+    - predicted: array-like of predicted values.
+
+    Returns:
+    - RMSE as a float.
+    """
+    actual = np.array(actual)
+    predicted = np.array(predicted)
+    return np.sqrt(np.mean((predicted - actual) ** 2))
+
+def calculate_mase(actual, predicted, training_actual=None):
+    """
+    Compute Mean Absolute Scaled Error (MASE).
+
+    Parameters:
+    - actual: array-like of true values for the forecast period.
+    - predicted: array-like of forecasted values.
+    - training_actual: array-like of in-sample actual values. If provided,
+      the scaling factor is computed on this data; otherwise, it's computed on `actual`.
+
+    Returns:
+    - MASE as a float.
+    """
+    actual = np.array(actual)
+    predicted = np.array(predicted)
+    
+    # Use training data for scaling if provided; otherwise, use the actual series.
+    train = np.array(training_actual) if training_actual is not None else actual
+    
+    # Compute naive forecast errors: absolute differences of successive observations
+    naive_errors = np.abs(np.diff(train))
+    
+    scale = np.mean(naive_errors)
+    if scale == 0:
+        return np.nan
+
+    # Compute MASE
+    mase = np.mean(np.abs(actual - predicted)) / scale
+    return mase
+
 
 def submission_viewer():
     st.subheader("Submission Viewer")
@@ -215,14 +264,39 @@ def submission_viewer():
     df_subs = list_submissions(api)
 
     df_subs["registered_at"] = df_subs["registered_at"].dt.tz_convert('CET')
+    
     # 2. Let user select submission
+    #df_subs["label"] = (
+    #    "Market date " + ((df_subs["registered_at"]+pd.Timedelta(days=1)).dt.strftime("%Y-%m-%d"))
+    #    +" | ID: " + df_subs["id"].astype(str)
+    #    + " | Time: " + df_subs["registered_at"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    #)
+
+    # Drop the latest market_date if not logged in
+    #try:
+    #    if not st.session_state.authenticated_overview:
+    #        latest_market_date = (df_subs["registered_at"] + pd.Timedelta(days=1)).max().date()
+    #        df_subs = df_subs[~((df_subs["registered_at"] + pd.Timedelta(days=1)).dt.date == latest_market_date)]
+    #except:
+    #    latest_market_date = (df_subs["registered_at"] + pd.Timedelta(days=1)).max().date()
+    #    #latest_market_date = (df_subs["registered_at"]).max().date()
+    #    df_subs = df_subs[~((df_subs["registered_at"] + pd.Timedelta(days=1)).dt.date == latest_market_date)]
+
+
+    # Create the label column
     df_subs["label"] = (
-        "Market date " + ((df_subs["registered_at"]+pd.Timedelta(days=1)).dt.strftime("%Y-%m-%d"))
-        +" | ID: " + df_subs["id"].astype(str)
+        "Market date " + ((df_subs["registered_at"] + pd.Timedelta(days=1)).dt.strftime("%Y-%m-%d"))
+        + " | ID: " + df_subs["id"].astype(str)
         + " | Time: " + df_subs["registered_at"].dt.strftime("%Y-%m-%d %H:%M:%S")
-        
     )
+    df_subs["dt"] = ((df_subs["registered_at"] + pd.Timedelta(days=1)).dt.strftime("%Y-%m-%d"))
+
+
+    df_subs = df_subs.drop_duplicates(subset=["dt"], keep="last")
+
+
     selected_label = st.selectbox("Select submission", df_subs["label"])
+
 
     # Extract the row matching the chosen label
     chosen_row = df_subs.loc[df_subs["label"] == selected_label].iloc[0]
@@ -256,7 +330,15 @@ def submission_viewer():
     # )
     data_slice = forecasts.dropna(subset='q10')
     # data_slice = forecasts.loc[mask]
+    df_sc = data_slice[['q50','DA elia (11AM)','actual elia']].copy().dropna()
+    myrmse = round(calculate_rmse(df_sc['q50'], df_sc['actual elia']),1)
+    eliarmse = round(calculate_rmse(df_sc['DA elia (11AM)'], df_sc['actual elia']),1)
 
+    mymase = round(calculate_mase(df_sc['q50'], df_sc['actual elia']),1)
+    eliamase = round(calculate_mase(df_sc['DA elia (11AM)'], df_sc['actual elia']),1)
+
+    st.markdown(f"**RMSE (q50):** {myrmse} , MASE : {mymase}")
+    st.markdown(f"**RMSE (DA elia):** {eliarmse} , MASE : {eliamase}")
 
     fig = go.Figure()
 
@@ -347,31 +429,238 @@ def submission_viewer():
 
     st.plotly_chart(fig)
 
+import re
+
+def get_latest_da_fcst_file(selected_date,files):
+    selected_str = pd.to_datetime(selected_date).strftime("%Y_%m_%d")
+    files_time = []
+    for f in files:
+        if not f.endswith(".parquet"):
+            continue
+        basename = f.split("/")[-1].split('_')
+        date_part = basename[0]+'_'+basename[1]+'_'+basename[2]
+        hour = basename[3] 
+        
+        if (date_part == selected_str) and (int(hour) < 10):
+
+            files_time.append(f)
+
+    if  len(files_time)==0:
+        #st.warning("No files found for the selected date before 10:00.")
+        return
+    selected_file = sorted(files_time)
+    return selected_file[-1]
+
+def get_latest_wind_offshore(start) -> pd.DataFrame:
+    start = start + pd.Timedelta(days=1)
+    end = start
+    start = start.strftime('%Y-%m-%d')
+    end = end.strftime('%Y-%m-%d')
+
+    url = (f'https://griddata.elia.be/eliabecontrols.prod/interface/windforecasting/'
+    f'forecastdata?beginDate={start}&endDate={end}&region=1&'
+    f'isEliaConnected=&isOffshore=True')
+
+    d = pd.read_json(url).rename(
+        columns={
+            'dayAheadConfidence10':'DA elia (11AM) P10',
+            'dayAheadConfidence90':'DA elia (11AM) P90',
+            'dayAheadForecast':'DA elia (11AM)',
+            'monitoredCapacity':'capa',
+            'mostRecentForecast':'latest elia forecast',
+            'realtime':'actual elia',
+            'startsOn':'Datetime',
+            })[['DA elia (11AM)','actual elia','Datetime','latest elia forecast']]
+    d['Datetime'] = pd.to_datetime(d['Datetime'])
+    d.index = d['Datetime']
+    # d = d.tz_localize('CET')
+    return d.rename(columns={'actual elia':'actual'})
+
+def benchmark():
+    if st.button("Clear Cache"):
+        st.cache_resource.clear()
+        st.write("Cache cleared!")
+
+    from st_files_connection import FilesConnection
+
+
+    st.title("Benchmark Models")
+    conn = st.connection('gcs', type=FilesConnection)
+
+    selected_date = st.date_input("Submission date", pd.to_datetime("today"))
+
+    latest_actual = get_latest_wind_offshore(selected_date)
+
+    l=[]
+    for model in ['avg','metno','dmi_seamless','meteofrance','icon','knmi']:
+        try:
+            
+            #files = conn._instance.ls(f"oracle_predictions/predico-elia/forecasts/{model}", max_results=30)
+            
+
+            all_files = []
+            token = None
+            while True:
+                res = conn._instance.ls(
+                    f"oracle_predictions/predico-elia/forecasts/{model}",
+                    max_results=100,
+                    page_token=token
+                )
+                # If ls returns a tuple, take the first two elements; otherwise, treat it as files only.
+                if isinstance(res, tuple):
+                    files = res[0]
+                    token = res[1] if len(res) > 1 else None
+                else:
+                    files = res
+                    token = None
+
+                all_files.extend(files)  # extend() flattens the list if files is a list
+                if not token:
+                    break
+
+            sel = get_latest_da_fcst_file(selected_date,all_files)
+            #print(sel)
+            df = conn.read(sel, input_format="parquet")
+            try:
+                df = df[[0.1,0.5,0.9]]
+            except:
+                df = df[['0.1','0.5','0.9']]
+            df.columns = [0.1,0.5,0.9]
+            l.append(df.add_prefix(f'{model}_'))
+
+        except Exception as e:
+            pass    
+    df = pd.concat(l,axis=1)
+    df.index = pd.to_datetime(df.index)
+    try:
+        df = pd.concat([latest_actual.drop(columns='Datetime'),df],axis=1)
+        default_cols = ['actual', 'DA elia (11AM)','avg_0.5','metno_0.5', 'dmi_seamless_0.5', 'meteofrance_0.5','knmi_0.5']
+
+    except:
+        default_cols = ['DA elia (11AM)','avg_0.5','metno_0.5', 'dmi_seamless_0.5', 'meteofrance_0.5','knmi_0.5']
+
+        pass
+
+    df = df.iloc[-96:].copy()
+
+    y_cols = df.columns
+
+    # Define default columns to always show
+    color_map = {
+    'actual': 'white',
+    'DA elia (11AM)':'orange',
+    'avg_0.5': "rgb(5, 222, 255)",
+    'metno_0.5': 'red',
+    'dmi_seamless_0.5': 'green',
+    'meteofrance_0.5': 'purple',
+    'knmi_0.5':'grey',
+    }
+    fig = go.Figure()
+
+    # Add all traces; set visible True if trace name is in default_cols
+    for col in y_cols:
+        try:
+            fig.add_trace(go.Scatter(
+                x=df.index,
+                y=df[col],
+                mode='lines',
+                name=col,
+                visible=(col in default_cols),
+                line_color=color_map[col],
+                showlegend=False
+            ))
+        except:
+            pass
+    fig.update_layout(
+        xaxis_title="Datetime",
+        yaxis_title="MW",
+        yaxis=dict(range=[0, 2300]),
+        template="plotly_dark",  # Optional: in dark mode to let white stand out
+       # showlegend=False
+    )
+
+
+    st.plotly_chart(fig)
+
+
+    def mean_pinball_loss(actual, forecast, alpha=0.5):
+        return np.mean(np.maximum(alpha*(actual - forecast), (alpha-1)*(actual - forecast)))
+
+    def compute_scores(group, col):
+        error = group.actual - group[col]
+        rmse = np.sqrt(np.mean(error**2))
+        mae  = np.mean(np.abs(error))
+        pinball = mean_pinball_loss(group.actual, group[col], alpha=0.5)
+        return pd.Series({f'{col}_RMSE': rmse, f'{col}_MAE': mae})
+
+    cols = [
+    'metno_0.5', 'meteofrance_0.5', 'avg_0.5',
+    'icon_0.5', 'knmi_0.5', 'dmi_seamless_0.5'
+        ]
+    try:
+        df =df.dropna()
+        scores = df.groupby(df.index.date).apply(
+        lambda grp: pd.concat([compute_scores(grp, col) for col in cols if col in grp.columns])
+        )
+
+        rmse =scores.loc[:, scores.columns.str.contains('RMSE')].dropna().T
+        mae =scores.loc[:, scores.columns.str.contains('MAE')].dropna().T
+
+
+        st.dataframe(rmse.T.tail(1))
+        st.dataframe(mae.T.tail(1))
+    except:
+        pass
+
+    #st.dataframe(df)
+
+
+
+
 
 
 def overview():
     """
     Let user pick a start/end date, then fetch & plot only that range.
     """
+    # Add password protection
+    PASSWORD = pwd_view  # Set your password
+    if "authenticated_overview" not in st.session_state:
+        st.session_state.authenticated_overview = False
+
+    if not st.session_state.authenticated_overview:
+        password = st.text_input("Enter Password to Access Overview:", type="password")
+        if st.button("Login"):
+            if password == PASSWORD:
+                st.session_state.authenticated_overview = True
+                st.success("Access granted!")
+            else:
+                st.error("Invalid password!")
+        return
+
+    # If authenticated, proceed with the overview logic
     st.title("Ranking & PnL")
-    
     api = get_api()
     data = fetch_last_50_scores(api)
     st.plotly_chart(plot_rank_and_payout_separate(data))
-    st.dataframe(data.sort_values(by='market_date',ascending=False).drop(columns='variable'))
-
-
+    st.dataframe(data.sort_values(by='market_date', ascending=False).drop(columns='variable'))
     
+
+import os, sys
 
 # ---------------- Main App with Navigation ----------------
 def main():
     st.sidebar.title("Navigation")
-    page_choice = st.sidebar.radio("Go to page:", ["Submission Viewer", "Overview"])
+    page_choice = st.sidebar.radio("Go to page:", ["Submission Viewer", "Overview",'Benchmark'])
     if page_choice == "Submission Viewer":
         submission_viewer()
-    else:
+    elif page_choice== 'Overview':
         overview()
+    elif page_choice == 'Benchmark':
+        benchmark()
+
     
+        
 
 if __name__ == "__main__":
     main()
